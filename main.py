@@ -13,10 +13,10 @@ import os
 import re
 import random
 import httpx
-from typing import Optional, List
+from typing import Optional, List, Any, Union
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -42,26 +42,8 @@ SCAM_KEYWORDS = [
 ]
 
 # =============================================================================
-# PYDANTIC MODELS
+# PYDANTIC MODELS (Flexible)
 # =============================================================================
-
-class Message(BaseModel):
-    text: str
-    role: Optional[str] = None
-    timestamp: Optional[str] = None
-
-
-class ConversationHistoryItem(BaseModel):
-    role: Optional[str] = None
-    text: str
-
-
-class HoneypotRequest(BaseModel):
-    sessionId: str
-    message: Message
-    conversationHistory: Optional[List[ConversationHistoryItem]] = Field(default_factory=list)
-    metadata: Optional[dict] = None
-
 
 class HoneypotResponse(BaseModel):
     status: str = "success"
@@ -88,8 +70,59 @@ class CallbackPayload(BaseModel):
 # IN-MEMORY SESSION TRACKING (for callback decision)
 # =============================================================================
 
-# Tracks session data: {sessionId: {"message_count": int, "intel": ExtractedIntelligence, "callback_sent": bool}}
 session_store: dict = {}
+
+
+# =============================================================================
+# REQUEST PARSING (Flexible - handles multiple formats)
+# =============================================================================
+
+def parse_request_body(body: dict) -> tuple[str, str, list]:
+    """
+    Parse request body flexibly to handle different formats.
+    Returns (session_id, message_text, conversation_history)
+    
+    Supports formats:
+    1. {"sessionId": "...", "message": {"text": "..."}, "conversationHistory": [...]}
+    2. {"sessionId": "...", "message": "...", "conversationHistory": [...]}
+    3. {"session_id": "...", "text": "...", "history": [...]}
+    4. {"sessionId": "...", "text": "..."}
+    5. And more variations...
+    """
+    # Extract session ID (try multiple field names)
+    session_id = (
+        body.get("sessionId") or 
+        body.get("session_id") or 
+        body.get("session") or
+        body.get("id") or
+        "default-session"
+    )
+    
+    # Extract message text (try multiple field names and structures)
+    message = body.get("message")
+    if isinstance(message, dict):
+        message_text = message.get("text") or message.get("content") or message.get("body") or ""
+    elif isinstance(message, str):
+        message_text = message
+    else:
+        message_text = (
+            body.get("text") or 
+            body.get("content") or 
+            body.get("body") or
+            body.get("msg") or
+            ""
+        )
+    
+    # Extract conversation history
+    history = (
+        body.get("conversationHistory") or 
+        body.get("conversation_history") or
+        body.get("history") or
+        body.get("messages") or
+        []
+    )
+    
+    return str(session_id), str(message_text), list(history) if history else []
 
 
 # =============================================================================
@@ -125,7 +158,7 @@ def extract_intelligence(text: str, matched_keywords: List[str]) -> ExtractedInt
     # Extract UPI IDs (format: username@bankcode)
     upi_pattern = r'[a-zA-Z0-9._-]+@[a-zA-Z]{2,10}'
     upi_matches = re.findall(upi_pattern, text)
-    # Filter out email-like patterns (those with common email domains)
+    # Filter out email-like patterns
     email_domains = ['gmail', 'yahoo', 'hotmail', 'outlook', 'mail', 'email']
     intel.upiIds = [upi for upi in upi_matches if not any(domain in upi.lower() for domain in email_domains)]
     
@@ -143,7 +176,6 @@ def extract_intelligence(text: str, matched_keywords: List[str]) -> ExtractedInt
     # Extract potential bank account numbers (10-18 digit numbers)
     bank_pattern = r'\b\d{10,18}\b'
     potential_accounts = re.findall(bank_pattern, text)
-    # Filter out phone numbers from bank accounts
     intel.bankAccounts = [acc for acc in potential_accounts if acc not in intel.phoneNumbers]
     
     return intel
@@ -164,7 +196,6 @@ def merge_intelligence(existing: ExtractedIntelligence, new: ExtractedIntelligen
 # AGENT PERSONA RESPONSES
 # =============================================================================
 
-# Response templates for different scenarios
 CONFUSED_RESPONSES = [
     "I'm not sure I understand. Can you explain what you mean?",
     "Sorry, I didn't receive any notification about this. Which department are you from?",
@@ -199,27 +230,17 @@ COOPERATIVE_BUT_CLUELESS_RESPONSES = [
 ]
 
 
-def generate_persona_reply(message_text: str, history: List[ConversationHistoryItem], is_scam: bool) -> str:
+def generate_persona_reply(message_text: str, history_length: int, is_scam: bool) -> str:
     """
-    Generate a human-like response that:
-    - Sounds like a confused or cautious user
-    - Asks clarifying questions
-    - Never reveals scam detection
-    - Varies based on conversation history
+    Generate a human-like response based on conversation stage.
     """
-    history_length = len(history) if history else 0
-    
     if history_length == 0:
-        # First message - be confused
         return random.choice(CONFUSED_RESPONSES)
     elif history_length == 1:
-        # Second turn - ask for clarification
         return random.choice(CLARIFICATION_RESPONSES)
     elif history_length == 2:
-        # Third turn - be cautious but cooperative
         return random.choice(CAUTIOUS_RESPONSES)
     else:
-        # Subsequent turns - mix of cooperative and cautious
         all_responses = COOPERATIVE_BUT_CLUELESS_RESPONSES + CAUTIOUS_RESPONSES
         return random.choice(all_responses)
 
@@ -229,12 +250,8 @@ def generate_persona_reply(message_text: str, history: List[ConversationHistoryI
 # =============================================================================
 
 async def send_callback(session_id: str, total_messages: int, intel: ExtractedIntelligence):
-    """
-    Send final intelligence to GUVI callback endpoint.
-    This is fire-and-forget - we don't block the main response.
-    """
+    """Send final intelligence to GUVI callback endpoint."""
     try:
-        # Generate agent notes based on extracted intelligence
         notes_parts = []
         if intel.phishingLinks:
             notes_parts.append(f"Detected {len(intel.phishingLinks)} phishing link(s)")
@@ -263,17 +280,11 @@ async def send_callback(session_id: str, total_messages: int, intel: ExtractedIn
             )
             print(f"[CALLBACK] Sent for session {session_id}: Status {response.status_code}")
     except Exception as e:
-        # Log but don't fail - callback errors should not affect main response
         print(f"[CALLBACK ERROR] Session {session_id}: {str(e)}")
 
 
 def should_send_callback(session_id: str, intel: ExtractedIntelligence) -> bool:
-    """
-    Determine if we should send the callback based on:
-    - Scam is detected
-    - AND (message count >= 3 OR intelligence was extracted)
-    - AND callback hasn't been sent for this session yet
-    """
+    """Determine if callback should be sent."""
     session = session_store.get(session_id, {})
     
     if session.get("callback_sent", False):
@@ -296,7 +307,6 @@ def should_send_callback(session_id: str, intel: ExtractedIntelligence) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
     print("🍯 Honeypot API starting...")
     print(f"📍 Callback URL: {GUVI_CALLBACK_URL}")
     yield
@@ -310,7 +320,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -321,61 +330,46 @@ app.add_middleware(
 
 
 # =============================================================================
-# API KEY AUTHENTICATION
-# =============================================================================
-
-def verify_api_key(x_api_key: str = Header(..., alias="x-api-key")):
-    """Validate the API key from request header."""
-    if x_api_key != API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API key"
-        )
-    return x_api_key
-
-
-# =============================================================================
 # ENDPOINTS
 # =============================================================================
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
     return {"status": "healthy", "service": "honeypot-api", "version": "1.0.0"}
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint for monitoring."""
     return {"status": "healthy"}
 
 
-@app.post("/honeypot", response_model=HoneypotResponse)
+@app.post("/honeypot")
 async def honeypot_endpoint(
-    request: HoneypotRequest,
+    request: Request,
     background_tasks: BackgroundTasks,
-    api_key: str = Header(..., alias="x-api-key")
+    x_api_key: Optional[str] = Header(None, alias="x-api-key")
 ):
     """
-    Main honeypot endpoint that processes scam messages.
-    
-    - Authenticates using x-api-key header
-    - Detects scam intent from message
-    - Generates human-like reply
-    - Extracts intelligence (UPI, URLs, phones, keywords)
-    - Sends callback when conditions are met
-    - Always returns valid JSON response
+    Main honeypot endpoint - accepts flexible request formats.
     """
     try:
         # Validate API key
-        if api_key != API_KEY:
+        if x_api_key != API_KEY:
             raise HTTPException(status_code=401, detail="Invalid API key")
         
-        session_id = request.sessionId
-        message_text = request.message.text
-        history = request.conversationHistory or []
+        # Parse request body flexibly
+        try:
+            body = await request.json()
+        except:
+            body = {}
         
-        # Initialize or update session tracking
+        session_id, message_text, history = parse_request_body(body)
+        
+        # Handle empty message
+        if not message_text:
+            return {"status": "success", "reply": "Hello! How can I help you today?"}
+        
+        # Initialize or update session
         if session_id not in session_store:
             session_store[session_id] = {
                 "message_count": 0,
@@ -397,7 +391,8 @@ async def honeypot_endpoint(
         session_store[session_id]["intel"] = merged_intel
         
         # Generate persona reply
-        reply = generate_persona_reply(message_text, history, is_scam)
+        history_length = len(history)
+        reply = generate_persona_reply(message_text, history_length, is_scam)
         
         # Check if callback should be sent
         if is_scam and should_send_callback(session_id, merged_intel):
@@ -405,18 +400,13 @@ async def honeypot_endpoint(
             total_messages = session_store[session_id]["message_count"]
             background_tasks.add_task(send_callback, session_id, total_messages, merged_intel)
         
-        return HoneypotResponse(status="success", reply=reply)
+        return {"status": "success", "reply": reply}
     
     except HTTPException:
-        # Re-raise HTTP exceptions (like 401)
         raise
     except Exception as e:
-        # Log error but return safe response
-        print(f"[ERROR] Session {request.sessionId if request else 'unknown'}: {str(e)}")
-        return HoneypotResponse(
-            status="success",
-            reply="Can you please explain this in more detail?"
-        )
+        print(f"[ERROR] {str(e)}")
+        return {"status": "success", "reply": "Can you please explain this in more detail?"}
 
 
 # =============================================================================
