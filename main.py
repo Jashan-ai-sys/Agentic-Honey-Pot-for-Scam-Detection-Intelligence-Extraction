@@ -355,7 +355,8 @@ async def honeypot_endpoint(
     try:
         # Validate API key
         if x_api_key != API_KEY:
-            raise HTTPException(status_code=401, detail="Invalid API key")
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=401, content={"status": "error", "detail": "Invalid API key"})
         
         # Parse request body flexibly
         try:
@@ -402,8 +403,6 @@ async def honeypot_endpoint(
         
         return {"status": "success", "reply": reply}
     
-    except HTTPException:
-        raise
     except Exception as e:
         print(f"[ERROR] {str(e)}")
         return {"status": "success", "reply": "Can you please explain this in more detail?"}
